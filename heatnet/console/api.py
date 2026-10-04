@@ -50,6 +50,12 @@ class Api:
         add("GET", "/api/pressure", self._pressure)
         add("GET", "/api/quota", self._quota)
         add("GET", "/api/billing", self._billing)
+        add("GET", "/api/recon/latest", self._recon_latest)
+        add("GET", "/api/recon/runs", self._recon_runs)
+        add("GET", "/api/recon/audit", self._recon_audit)
+        add("GET", "/api/recon/verify", self._recon_verify)
+        add("POST", "/api/recon/run", self._recon_run)
+        add("POST", "/api/recon/demo", self._recon_demo)
         add("GET", "/api/trend", self._trend)
         add("GET", "/api/events", self._events)
         add("GET", "/api/audit", self._audit)
@@ -178,6 +184,80 @@ class Api:
     def _billing(self, params: dict, body: dict) -> dict:
         quota = float(params.get("quota_mwh", self._platform.config.quota.meter_wrap_mwh / 40.0))
         return {"lines": self._platform.billing(quota)}
+
+    # ---- 断联补账 -----------------------------------------------------
+
+    def _parse_recon_input(self, body: dict) -> tuple[str, list, list]:
+        """从请求体解析 month / profiles / samples。"""
+
+        from ..recon.state import MeterProfile, Sample
+
+        month = str(body.get("month", ""))
+        if not month:
+            raise PlantError("缺少 month（YYYY-MM）", component="recon")
+        profiles = [
+            MeterProfile(
+                meter=str(item["meter"]),
+                kind=str(item["kind"]),
+                wrap_kwh=float(item["wrap_kwh"]),
+                period_s=float(item["period_s"]),
+                k_factor=float(item.get("k_factor", 1.163)),
+                max_power_kw=(None if item.get("max_power_kw") is None
+                              else float(item["max_power_kw"])),
+            )
+            for item in body.get("profiles", [])
+        ]
+        samples = [
+            Sample(
+                ts=float(item["ts"]),
+                meter=str(item["meter"]),
+                energy_kwh=(None if item.get("energy_kwh") is None else float(item["energy_kwh"])),
+                flow_t_h=(None if item.get("flow_t_h") is None else float(item["flow_t_h"])),
+                supply_c=(None if item.get("supply_c") is None else float(item["supply_c"])),
+                return_c=(None if item.get("return_c") is None else float(item["return_c"])),
+            )
+            for item in body.get("samples", [])
+        ]
+        if not profiles:
+            raise PlantError("缺少表型 profiles", component="recon")
+        if not samples:
+            raise PlantError("缺少原始采样 samples", component="recon")
+        return month, profiles, samples
+
+    def _recon_run(self, params: dict, body: dict) -> dict:
+        month, profiles, samples = self._parse_recon_input(body)
+        return self._platform.run_reconciliation(
+            month, profiles, samples, source=str(body.get("source", "console"))
+        )
+
+    def _recon_demo(self, params: dict, body: dict) -> dict:
+        from ..recon.service import demo_dataset
+
+        month = str(body.get("month", "2026-09"))
+        profiles, samples = demo_dataset(month)
+        return self._platform.run_reconciliation(month, profiles, samples, source="console-demo")
+
+    def _recon_latest(self, params: dict, body: dict) -> dict:
+        month = str(params.get("month", ""))
+        if not month:
+            raise PlantError("缺少 month", component="recon")
+        record = self._platform.reconciliation_latest(month)
+        return {"month": month, "found": record is not None, "record": record}
+
+    def _recon_runs(self, params: dict, body: dict) -> dict:
+        records = self._platform.reconciliation_runs()
+        return {"count": len(records), "runs": records}
+
+    def _recon_audit(self, params: dict, body: dict) -> dict:
+        limit = int(params.get("limit", 100))
+        entries = self._platform.recon_store.audit_entries()
+        month = params.get("month")
+        if month:
+            entries = [entry for entry in entries if entry.get("month") == month]
+        return {"entries": entries[-limit:]}
+
+    def _recon_verify(self, params: dict, body: dict) -> dict:
+        return self._platform.reconciliation_verify()
 
     def _trend(self, params: dict, body: dict) -> dict:
         signal = params.get("signal", "supply_c")

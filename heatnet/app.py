@@ -31,6 +31,8 @@ from .quota.accumulator import QuotaAccumulator
 from .quota.billing import billing_lines
 from .quota.meter import HeatMeter
 from .quota.quota import QuotaLedger
+from .recon.state import MeterProfile, Sample
+from .recon.store import ReconcileStore
 from .secondary.cycle import run_cycle
 from .secondary.loop import SecondaryLoop
 from .sequence import advance_heating, dispatch_demand, recalibrate_flow, shutdown_plant, startup_plant
@@ -89,6 +91,9 @@ class Platform:
         self.audit = AuditLog(
             self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512)
         )
+        # 断联补账用独立的只追加存储（原始归档/补账总账/哈希链审计），与平台
+        # 运行期审计分开，保证补账历史不可变、可独立回放。
+        self.recon_store = ReconcileStore(f"{store.root}/recon")
         self.namespaces = NamespaceRegistry(unit)
         self.topology: Topology = build_default_topology()
         self.trend = TrendBuffer(period_s=self.config.quota.sample_period_s)
@@ -761,6 +766,59 @@ class Platform:
         """按站生成配额结算行。"""
 
         return billing_lines(self.ledger, quota_mwh)
+
+    # ---- 断联补账 -----------------------------------------------------
+
+    def run_reconciliation(
+        self, month: str, profiles: list[MeterProfile], samples: list[Sample], *, source: str = "console"
+    ) -> dict:
+        """执行一次月度断联补账：原始数据归档、结果追加、审计留痕。
+
+        补账结果与平台审计口径一致；存在标缺段是部分失败（正常返回，结果里
+        ``partial_failure=True``），审计按 warning 落，不允许把缺值硬凑成热量。
+        """
+
+        from .recon.report import run_payload
+        from .recon.service import ReconcileService
+
+        service = ReconcileService(self.recon_store, self.clock.now())
+        run = service.run(month, profiles, samples, source=source)
+        # 同步一条到平台总审计，方便值班时间线看到补账发生。
+        self.bus.publish(
+            Event(
+                "recon",
+                "reconciled",
+                {
+                    "severity": "warning" if run.partial_failure else "notice",
+                    "asset": "heat-meters",
+                    "message": (
+                        f"{month} 断联补账: 入账 {run.totals()['booked_kwh']:.1f} kWh, "
+                        f"标缺 {run.totals()['missing_segments']} 段"
+                    ),
+                    "run_id": run.run_id,
+                    "month": month,
+                    "partial_failure": run.partial_failure,
+                },
+            )
+        )
+        return run_payload(run)
+
+    def reconciliation_latest(self, month: str) -> dict | None:
+        """读取某月最新补账（历史只追加，取该月最大批次号）。"""
+
+        return self.recon_store.latest_run(month)
+
+    def reconciliation_runs(self) -> list[dict]:
+        """列出全部补账批次。"""
+
+        return self.recon_store.list_runs()
+
+    def reconciliation_verify(self) -> dict:
+        """校验补账审计哈希链与总账一致性。"""
+
+        from .recon.service import ReconcileService
+
+        return ReconcileService(self.recon_store, self.clock.now()).verify()
 
     def plan_preview(self, demand_pct: float) -> list[dict]:
         """预览一次调度计划（不触碰设备）。"""
