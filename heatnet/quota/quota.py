@@ -18,6 +18,7 @@ class QuotaLedger:
         self._limits = limits
         self._accumulator = accumulator
         self._allocations: dict[str, float] = {}
+        self._backfilled: dict[str, float] = {}
         self._periods = 0
 
     @property
@@ -40,6 +41,24 @@ class QuotaLedger:
 
         return self._allocations.get(station, 0.0)
 
+    def apply_backfill(self, station: str, mwh: float) -> float:
+        """把一笔补账追加进本期总账：只加不改，原有记录保持历史不可变。"""
+
+        value = max(0.0, float(mwh))
+        self._allocations[station] = self._allocations.get(station, 0.0) + value
+        self._backfilled[station] = self._backfilled.get(station, 0.0) + value
+        return self._allocations[station]
+
+    def backfilled_mwh(self, station: str) -> float:
+        """返回某站本期补账入账的热量。"""
+
+        return self._backfilled.get(station, 0.0)
+
+    def backfill_total_mwh(self) -> float:
+        """返回本期全部站的补账热量之和。"""
+
+        return sum(self._backfilled.values())
+
     def stations(self) -> list[str]:
         """返回本期出现过的站名（排序后）。"""
 
@@ -58,7 +77,7 @@ class QuotaLedger:
         return min(collected, allocated) if allocated else collected
 
     def settle(self) -> dict:
-        """结束本期：累计周期数并返回结算摘要。"""
+        """结束本期：累计周期数并返回结算摘要（含本期补账拆分）。"""
 
         self._periods += 1
         payload = {
@@ -66,8 +85,12 @@ class QuotaLedger:
             "hours": self._limits.period_hours,
             "total_mwh": round(self.total_mwh(), 4),
             "stations": {name: round(value, 4) for name, value in sorted(self._allocations.items())},
+            "backfilled_mwh": {
+                name: round(value, 4) for name, value in sorted(self._backfilled.items())
+            },
         }
         self._allocations = {}
+        self._backfilled = {}
         return payload
 
     def snapshot(self) -> QuotaSnapshot:
@@ -79,4 +102,5 @@ class QuotaLedger:
             wraps=self._accumulator.wraps(),
             stations=len(self._allocations),
             period_hours=self._limits.period_hours,
+            backfill_mwh=self.backfill_total_mwh(),
         )

@@ -50,6 +50,7 @@ class Api:
         add("GET", "/api/pressure", self._pressure)
         add("GET", "/api/quota", self._quota)
         add("GET", "/api/billing", self._billing)
+        add("GET", "/api/backfill", self._backfill_report)
         add("GET", "/api/trend", self._trend)
         add("GET", "/api/events", self._events)
         add("GET", "/api/audit", self._audit)
@@ -69,6 +70,7 @@ class Api:
         add("POST", "/api/secondary/cycle", self._secondary_cycle)
         add("POST", "/api/meter", self._meter)
         add("POST", "/api/settle", self._settle)
+        add("POST", "/api/backfill", self._backfill_apply)
         add("POST", "/api/zone/split", self._split)
         add("POST", "/api/valve/replay", self._replay)
         add("POST", "/api/pump", self._pump)
@@ -178,6 +180,9 @@ class Api:
     def _billing(self, params: dict, body: dict) -> dict:
         quota = float(params.get("quota_mwh", self._platform.config.quota.meter_wrap_mwh / 40.0))
         return {"lines": self._platform.billing(quota)}
+
+    def _backfill_report(self, params: dict, body: dict) -> dict:
+        return self._platform.backfill_report()
 
     def _trend(self, params: dict, body: dict) -> dict:
         signal = params.get("signal", "supply_c")
@@ -305,6 +310,14 @@ class Api:
 
     def _settle(self, params: dict, body: dict) -> dict:
         return self._platform.settle_quota()
+
+    def _backfill_apply(self, params: dict, body: dict) -> dict:
+        meter = str(body.get("meter") or self._platform.meter_names()[0])
+        gaps = body.get("gaps")
+        if gaps is None:
+            gap = body.get("gap")
+            gaps = [gap] if isinstance(gap, dict) else []
+        return self._platform.backfill_heat(meter, gaps)
 
     def _split(self, params: dict, body: dict) -> dict:
         stations = body.get("stations") or []

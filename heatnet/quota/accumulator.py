@@ -52,6 +52,11 @@ class QuotaAccumulator:
             self._collections += 1
         return reading
 
+    def backfill(self, name: str, delta_mwh: float) -> float:
+        """把一笔补账增量入账到对应表（不计入采集次数，采集口径保持纯净）。"""
+
+        return self.get(name).add(delta_mwh)
+
     def collections(self) -> int:
         """返回累计采集次数。"""
 

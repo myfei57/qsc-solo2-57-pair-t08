@@ -2,7 +2,8 @@
 
 表读数到顶后回绕，因此同时维护"当前读数"和"累计热量"：前者是现场表头，后者是
 结算用的总量。累加必须原子——``self._reading += delta`` 在多线程下会读改写交错，
-丢掉的增量既不在表头也不在总量里。
+丢掉的增量既不在表头也不在总量里。表型（积算式／总量式）是物理属性，登记后不变，
+断联补账按表型选方法。
 """
 
 from __future__ import annotations
@@ -11,14 +12,21 @@ import threading
 
 from .state import MeterSnapshot
 
+INTEGRATING = "integrating"
+TOTALIZING = "totalizing"
+METER_KINDS = (INTEGRATING, TOTALIZING)
+
 
 class HeatMeter:
     """一块带回绕的热量表。"""
 
-    def __init__(self, name: str, wrap_mwh: float) -> None:
+    def __init__(self, name: str, wrap_mwh: float, kind: str = TOTALIZING) -> None:
         if wrap_mwh <= 0:
             raise ValueError("回绕阈值必须为正")
+        if kind not in METER_KINDS:
+            raise ValueError(f"未知表型: {kind}")
         self._name = name
+        self._kind = kind
         self._wrap_mwh = float(wrap_mwh)
         self._reading_mwh = 0.0
         self._total_mwh = 0.0
@@ -29,6 +37,12 @@ class HeatMeter:
     @property
     def name(self) -> str:
         return self._name
+
+    @property
+    def kind(self) -> str:
+        """返回表型（积算式／总量式），补账按它选方法。"""
+
+        return self._kind
 
     @property
     def wrap_mwh(self) -> float:
@@ -88,6 +102,7 @@ class HeatMeter:
         with self._lock:
             return MeterSnapshot(
                 name=self._name,
+                kind=self._kind,
                 reading_mwh=self._reading_mwh,
                 total_mwh=self._total_mwh,
                 wraps=self._wraps,

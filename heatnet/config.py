@@ -3,7 +3,7 @@
 配置来自 JSON 文件（标准库解析），覆盖热源供温带与调质确认时间、供热曲线的
 室外温度区间与过期时间、换热站混水阀行程与批量确认时间、一次网流量基线与
 调度速率、二次网补水定压带、阀门行程公差、循环泵升速斜率、定压基线范围与
-热量表回绕阈值，以及状态存储目录。任何缺失或越界取值都在装配阶段抛出
+热量表回绕阈值、补账分档阈值，以及状态存储目录。任何缺失或越界取值都在装配阶段抛出
 :class:`ConfigError`，不允许带着半份配置启动控制链。
 """
 
@@ -261,11 +261,13 @@ class PressureLimits:
 
 @dataclass(frozen=True)
 class QuotaLimits:
-    """热量表回绕阈值与结算周期。"""
+    """热量表回绕阈值、结算周期与补账分档阈值。"""
 
     meter_wrap_mwh: float
     sample_period_s: float
     period_hours: float
+    backfill_full_below_mwh: float
+    backfill_max_gap_s: float
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "QuotaLimits":
@@ -273,6 +275,8 @@ class QuotaLimits:
             meter_wrap_mwh=_number(section, "meter_wrap_mwh", minimum=1.0),
             sample_period_s=_number(section, "sample_period_s", minimum=1.0),
             period_hours=_number(section, "period_hours", minimum=0.1),
+            backfill_full_below_mwh=_number(section, "backfill_full_below_mwh", minimum=0.01),
+            backfill_max_gap_s=_number(section, "backfill_max_gap_s", minimum=1.0),
         )
 
 
@@ -344,7 +348,7 @@ def default_config() -> PlatformConfig:
         valve=ValveLimits(12.0, 1.5),
         pump=PumpLimits(40.0, 20.0, 100.0),
         pressure=PressureLimits(240.0, 430.0, 6.0),
-        quota=QuotaLimits(100000.0, 30.0, 24.0),
+        quota=QuotaLimits(100000.0, 30.0, 24.0, 2000.0, 21600.0),
     )
 
 
@@ -406,6 +410,8 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "meter_wrap_mwh": cfg.quota.meter_wrap_mwh,
                 "sample_period_s": cfg.quota.sample_period_s,
                 "period_hours": cfg.quota.period_hours,
+                "backfill_full_below_mwh": cfg.quota.backfill_full_below_mwh,
+                "backfill_max_gap_s": cfg.quota.backfill_max_gap_s,
             },
         },
     }

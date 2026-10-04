@@ -55,7 +55,9 @@
     "quota": {
       "meter_wrap_mwh": 100000.0,
       "sample_period_s": 30.0,
-      "period_hours": 24.0
+      "period_hours": 24.0,
+      "backfill_full_below_mwh": 2000.0,
+      "backfill_max_gap_s": 21600.0
     }
   }
 }

@@ -28,8 +28,15 @@ from .primary.network import PrimaryNetwork
 from .pump.curve import PumpCurve
 from .pump.pump import Pump
 from .quota.accumulator import QuotaAccumulator
+from .quota.backfill import (
+    STATUS_FILLED,
+    FlowTempSample,
+    GapSegment,
+    plan_gap,
+    summarize_entries,
+)
 from .quota.billing import billing_lines
-from .quota.meter import HeatMeter
+from .quota.meter import INTEGRATING, TOTALIZING, HeatMeter
 from .quota.quota import QuotaLedger
 from .secondary.cycle import run_cycle
 from .secondary.loop import SecondaryLoop
@@ -66,6 +73,25 @@ _ZONE_SPECS: tuple[tuple[str, float, tuple[str, ...]], ...] = (
 # 热量表按站登记，回绕阈值取配置值。
 _METER_SUFFIX = ".heat-meter"
 
+# 表型登记：积算式表带流量温差通道，断联按流量温差反算；总量式表只有表头读数，
+# 断联按前后读数差（回绕接上）或相邻时段插值。表型是物理属性，登记后不变。
+_METER_KINDS: dict[str, str] = {
+    "st01": INTEGRATING,
+    "st02": TOTALIZING,
+    "st03": INTEGRATING,
+    "st04": TOTALIZING,
+    "st05": INTEGRATING,
+    "st06": TOTALIZING,
+}
+
+
+def _optional_float(value: object) -> float | None:
+    """把可空数值转成浮点；缺省保持 ``None``，非法取值抛 ``TypeError``/``ValueError``。"""
+
+    if value is None:
+        return None
+    return float(value)  # type: ignore[arg-type]
+
 
 class Platform:
     """城市集中供热管网调度平台。"""
@@ -89,6 +115,7 @@ class Platform:
         self.audit = AuditLog(
             self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512)
         )
+        self.backfill_journal = JsonlJournal(store.root, "backfill", segment_limit=256)
         self.namespaces = NamespaceRegistry(unit)
         self.topology: Topology = build_default_topology()
         self.trend = TrendBuffer(period_s=self.config.quota.sample_period_s)
@@ -156,11 +183,12 @@ class Platform:
         return Pump("secondary.circulating", self.config.pump, curve)
 
     def _build_meters(self) -> None:
-        """按站登记热量表。"""
+        """按站登记热量表，表型按登记表带入。"""
 
         wrap = self.config.quota.meter_wrap_mwh
         for name in sorted(self.stations):
-            self.meters.register(HeatMeter(f"{name}{_METER_SUFFIX}", wrap))
+            kind = _METER_KINDS.get(name, TOTALIZING)
+            self.meters.register(HeatMeter(f"{name}{_METER_SUFFIX}", wrap, kind=kind))
 
     def _register_namespaces(self) -> None:
         """登记现场设备命名空间（控制台与审计共用同一套名字）。"""
@@ -577,6 +605,102 @@ class Platform:
             period = self.ledger.settle()
             return {**period, "lines": lines}
 
+    def backfill_heat(self, meter: str, gaps: list[dict]) -> dict:
+        """对一块表的若干断联缺口执行补账。
+
+        方法按表型定、分档按阈值定；每个缺口独立出账：能补的追加进表与总账，
+        缺条件的整段标缺。任一缺口标缺即整体部分失败（``ok=False``），已补的
+        不回滚。补账量同时进表、总账、补账流水与审计，四处是同一个数；原有
+        采集记录保持历史不可变，只追加不改写。
+        """
+
+        if not isinstance(gaps, list) or not gaps:
+            raise ValueError("至少给出一段缺口")
+        with self._lock:
+            meter_obj = self.meters.get(meter)
+            station = meter[: -len(_METER_SUFFIX)] if meter.endswith(_METER_SUFFIX) else meter
+            entries: list[dict] = []
+            for raw in gaps:
+                if not isinstance(raw, dict):
+                    raise ValueError("缺口段必须是映射")
+                segment = GapSegment(
+                    meter=meter,
+                    start_ts=float(raw.get("start_ts")),
+                    end_ts=float(raw.get("end_ts")),
+                    reading_before_mwh=_optional_float(raw.get("reading_before_mwh")),
+                    reading_after_mwh=_optional_float(raw.get("reading_after_mwh")),
+                    samples=tuple(
+                        FlowTempSample(
+                            ts=float(sample.get("ts")),
+                            flow_t_h=float(sample.get("flow_t_h")),
+                            delta_t_c=float(sample.get("delta_t_c")),
+                        )
+                        for sample in raw.get("samples") or ()
+                    ),
+                    rate_before_mwh_s=_optional_float(raw.get("rate_before_mwh_s")),
+                    rate_after_mwh_s=_optional_float(raw.get("rate_after_mwh_s")),
+                    collected_mwh=float(raw.get("collected_mwh") or 0.0),
+                )
+                plan = plan_gap(segment, meter_obj.kind, self.config.quota)
+                filled = plan.status == STATUS_FILLED
+                if filled and plan.backfill_mwh > 0.0:
+                    self.meters.backfill(meter, plan.backfill_mwh)
+                    self.ledger.apply_backfill(station, plan.backfill_mwh)
+                    self.trend.append("heat_mwh", self.clock.now(), self.meters.total_mwh())
+                entry = {
+                    "entry_id": self.ids.next(),
+                    "ts": round(self.clock.now(), 3),
+                    "station": station,
+                    **plan.as_dict(),
+                }
+                self.backfill_journal.append(entry)
+                reasons = list(plan.reasons)
+                self.bus.publish(
+                    Event.of(
+                        "quota",
+                        "quota",
+                        "backfill" if filled else "backfill_missing",
+                        severity="notice" if filled else "warning",
+                        message=(
+                            f"补账 {meter} +{plan.backfill_mwh:.4f} MWh（{plan.method}）"
+                            if filled
+                            else f"补账标缺 {meter}：{'、'.join(reasons)}"
+                        ),
+                        asset=meter,
+                        station=station,
+                        entry_id=entry["entry_id"],
+                        method=plan.method,
+                        status=plan.status,
+                        estimate_mwh=entry["estimate_mwh"],
+                        backfill_mwh=entry["backfill_mwh"],
+                        wraps=plan.wraps,
+                        reasons=reasons,
+                    )
+                )
+                entries.append(entry)
+            missing = [entry for entry in entries if entry["status"] != STATUS_FILLED]
+            return {
+                "ok": not missing,
+                "meter": meter,
+                "station": station,
+                "kind": meter_obj.kind,
+                "entries": entries,
+                "backfilled_mwh": round(sum(entry["backfill_mwh"] for entry in entries), 4),
+                "missing": len(missing),
+                "ledger_total_mwh": round(self.ledger.total_mwh(), 4),
+            }
+
+    def backfill_report(self) -> dict:
+        """返回补账流水与汇总，供控制台展示；流水只追加不改写。"""
+
+        entries = self.backfill_journal.read_all()
+        return {
+            "count": len(entries),
+            "entries": list(reversed(entries[-50:])),
+            "summary": summarize_entries(entries),
+            "ledger_backfill_mwh": round(self.ledger.backfill_total_mwh(), 4),
+        }
+
     def trip(self, reason: str = "overtemperature") -> dict:
         """让热源停机。"""
 
@@ -749,12 +873,16 @@ class Platform:
         return payload
 
     def quota_report(self) -> dict:
-        """返回热量表与配额总账报告。"""
+        """返回热量表与配额总账报告（含本期补账口径）。"""
 
         return {
             "ledger": self.ledger.snapshot().as_dict(),
             "accumulator": self.meters.describe(),
             "periods": self.ledger.periods(),
+            "backfill": {
+                "entries": self.backfill_journal.count(),
+                "backfilled_mwh": round(self.ledger.backfill_total_mwh(), 4),
+            },
         }
 
     def billing(self, quota_mwh: float) -> list[dict]:

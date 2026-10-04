@@ -10,6 +10,7 @@ class MeterSnapshot:
     """一次热量表读取的结果。"""
 
     name: str
+    kind: str
     reading_mwh: float
     total_mwh: float
     wraps: int
@@ -18,6 +19,7 @@ class MeterSnapshot:
     def as_dict(self) -> dict:
         return {
             "name": self.name,
+            "kind": self.kind,
             "reading_mwh": round(self.reading_mwh, 4),
             "total_mwh": round(self.total_mwh, 4),
             "wraps": self.wraps,
@@ -34,6 +36,7 @@ class QuotaSnapshot:
     wraps: int
     stations: int
     period_hours: float
+    backfill_mwh: float
 
     def as_dict(self) -> dict:
         return {
@@ -42,4 +45,5 @@ class QuotaSnapshot:
             "wraps": self.wraps,
             "stations": self.stations,
             "period_hours": self.period_hours,
+            "backfill_mwh": round(self.backfill_mwh, 4),
         }
